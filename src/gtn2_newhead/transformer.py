@@ -20,6 +20,7 @@ class Transformer(torch.nn.Module):
                  v: int,
                  h: int,
                  N: int,
+                 head_hidden: int,
                  class_num: int,
                  dropout: float = 0.2):
         super(Transformer, self).__init__()
@@ -42,10 +43,29 @@ class Transformer(torch.nn.Module):
             v=v,
             h=h,
             dropout=dropout) for _ in range(N)])
+        
+        self.head_relu = torch.nn.ReLU()
+        self.head_dropout = torch.nn.Dropout(p=dropout)
+        
+        self.timestep_avg_pool = torch.nn.AvgPool1d(d_timestep)
+        self.feature_avg_pool = torch.nn.AvgPool1d(d_feature)
 
-        self.gate = torch.nn.Linear(in_features=d_timestep * d_model + d_feature * d_model, out_features=2)
-        self.linear_out = torch.nn.Linear(in_features=d_timestep * d_model + d_feature * d_model,
-                                          out_features=class_num)
+        self.gate = torch.nn.Sequential(
+            torch.nn.Linear(in_features=d_model*2, out_features=d_model),
+            self.head_relu,
+            self.head_dropout,
+            torch.nn.Linear(in_features=d_model, out_features=head_hidden),
+            self.head_relu,
+            self.head_dropout,
+            torch.nn.Linear(in_features=head_hidden, out_features=2)
+        )
+
+        self.cls_head = torch.nn.Sequential(
+            torch.nn.Linear(in_features=d_model, out_features=head_hidden),
+            self.head_relu,
+            self.head_dropout,
+            torch.nn.Linear(in_features=head_hidden, out_features=class_num)
+        )
 
     def forward(self,
                 x: torch.Tensor,
@@ -54,37 +74,38 @@ class Transformer(torch.nn.Module):
         x_timestep, _ = self.timestep_embedding(x)
         x_feature, _ = self.feature_embedding(x)
 
-        # print("x_timestep", x_timestep.shape)
-        # print("x_feature", x_feature.shape)
-
         for encoder in self.timestep_encoderlist:
             x_timestep, heatmap = encoder(x_timestep, stage=stage)
 
         for encoder in self.feature_encoderlist:
             x_feature, heatmap = encoder(x_feature, stage=stage)
 
-        # print("after encoder")
         # print("x_timestep", x_timestep.shape)
         # print("x_feature", x_feature.shape)
 
-        x_timestep = x_timestep.reshape(x_timestep.shape[0], -1)
-        x_feature = x_feature.reshape(x_feature.shape[0], -1)
+        x_timestep = x_timestep.permute(0, 2, 1)
+        x_feature = x_feature.permute(0, 2, 1)
 
-        # print("after reshaping")
         # print("x_timestep", x_timestep.shape)
         # print("x_feature", x_feature.shape)
 
-        gate = torch.nn.functional.softmax(self.gate(torch.cat([x_timestep, x_feature], dim=-1)), dim=-1)
+        x_timestep_pooled = self.timestep_avg_pool(x_timestep).squeeze(2)
+        x_feature_pooled = self.feature_avg_pool(x_feature).squeeze(2)
 
-        # print("cat", torch.cat([x_timestep, x_feature], dim=-1).shape)
-        # print("gate", gate.shape)
+        # print("x_timestep_pooled", x_timestep_pooled.shape)
+        # print("x_feature_pooled", x_feature_pooled.shape)
 
-        gate_out = torch.cat([x_timestep * gate[:, 0:1], x_feature * gate[:, 1:2]], dim=-1)
+        x_concat = torch.cat([x_timestep_pooled, x_feature_pooled], dim=-1)
 
-        # print("gate_out", gate_out.shape)
+        # print("x_concat", x_concat.shape)
 
-        out = self.linear_out(gate_out)
 
-        # print("out", out.shape)
+        gate_weights = torch.nn.functional.softmax(self.gate(x_concat), dim=-1)
+
+        # print("gate_weights", gate_weights.shape)
+
+        gate_out = x_timestep_pooled * gate_weights[:, 0:1] + x_feature_pooled * gate_weights[:, 1:2]
+
+        out = self.cls_head(gate_out)
 
         return out
